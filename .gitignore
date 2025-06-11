@@ -1,0 +1,7 @@
+crawler/
+
+
+venv
+data
+media
+.env
