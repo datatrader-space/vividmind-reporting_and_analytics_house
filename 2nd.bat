@@ -14,7 +14,7 @@ IF EXIST "requirements.txt" (
 REM Start Django development server (replace 'yourproject' with your project name)
 python manage.py makemigrations
 python manage.py migrate
-START "" python manage.py runserver 0.0.0.0:80
+START "" python manage.py runserver 0.0.0.0:81
 START "" celery --app vividmind beat --loglevel=INFO --scheduler django_celery_beat.schedulers:DatabaseScheduler
 START "" celery --app=vividmind worker --pool=eventlet --loglevel=INFO
 START "" ngrok http 80
