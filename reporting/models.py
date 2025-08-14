@@ -42,7 +42,123 @@ class Task(models.Model):
         return f"Task {self.name} ({str(self.uuid)[:8]}...) in Job ..."
 
 
+class TaskReport(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    task = models.ForeignKey(
+        'Task',
+        on_delete=models.CASCADE,
+        related_name='reports',
+        db_index=True,
+        null=False,  # or `null=True` if you're still setting up
+        help_text="Reference to the associated Task object."
+    )
+    run_id = models.UUIDField(help_text="Unique ID for this specific run of the task.")
+
+    service = models.CharField(max_length=50, null=True, blank=True)
+    end_point = models.CharField(max_length=50, null=True, blank=True)
+    data_point = models.CharField(max_length=50, null=True, blank=True)
+
+    report_start_datetime = models.DateTimeField(null=True, blank=True)
+    report_end_datetime = models.DateTimeField(null=True, blank=True)
+
+    full_report = models.JSONField(help_text="Complete nested data report.")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ('run_id', 'task', 'data_point')
+        verbose_name = "Task Report"
+        verbose_name_plural = "Task Reports"
+
+    def __str__(self):
+        return f"{self.service} / {self.data_point} ({self.run_id})"
+
+class TaskSummaryReportNew(models.Model):
+    
+    task = models.OneToOneField('Task', on_delete=models.CASCADE, related_name='new_summary_report',null=True,blank=True)
+
+    # --- Aggregated counts and summaries ---
+    total_critical_events = models.IntegerField(default=0)
+    critical_events_summary = models.JSONField(default=list, blank=True)
+
+    total_login_attempts = models.IntegerField(default=0)
+    successful_logins = models.IntegerField(default=0)
+    failed_logins = models.IntegerField(default=0)
+    total_login_time = models.FloatField(default=0.0)
+
+    total_2fa_attempts = models.IntegerField(default=0)
+    total_2fa_successes = models.IntegerField(default=0)
+    total_2fa_failures = models.IntegerField(default=0)
+    total_2fa_time = models.FloatField(default=0.0)
+
+    total_attempt_failed = models.IntegerField(default=0)
+    attempt_failed_errors = models.JSONField(default=list, blank=True)
+    failed_attempt_error_logs = models.JSONField(default=list, blank=True)
+
+    login_exceptions_summary = models.JSONField(default=list, blank=True)
+    login_exceptions_count = models.IntegerField(default=0)
+
+    page_detection_exceptions_summary = models.JSONField(default=list, blank=True)
+    page_detection_exceptions_count = models.IntegerField(default=0)
+
+    locate_element_exceptions_summary = models.JSONField(default=list, blank=True)
+    locate_element_exceptions_count = models.IntegerField(default=0)
+
+    page_load_details = models.JSONField(default=dict, blank=True)
+
+    # --- Meta-Information about the aggregation ---
+    total_reports_considered = models.IntegerField(default=0)
+    first_report_datetime = models.DateTimeField(null=True, blank=True)
+    last_report_datetime = models.DateTimeField(null=True, blank=True)
+
+    has_next_page_info = models.BooleanField(default=None, null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    last_alerted_at = models.DateTimeField(null=True, blank=True)
+
+    # --- Latest States from latest TaskReport ---
+    latest_task_status = models.CharField(max_length=255, null=True, blank=True)
+    latest_login_status = models.CharField(max_length=64, null=True, blank=True)
+
+    latest_report_start_datetime = models.DateTimeField(null=True, blank=True)
+    latest_report_end_datetime = models.DateTimeField(null=True, blank=True)
+    latest_total_task_runtime = models.FloatField(default=0.0)
+    run_id_of_latest_report = models.CharField(max_length=255, null=True, blank=True)
+
+
+    # Scrape-related summary fields
+
+    # Count of users scraped
+    total_users_scraped = models.IntegerField(default=0)
+
+    # File and upload stats
+    total_downloaded_files = models.IntegerField(default=0)
+    total_storage_uploads = models.IntegerField(default=0)
+    failed_to_download_file_count = models.IntegerField(default=0)
+
+    # Next page info detection
+    found_next_page_info_count = models.IntegerField(default=0)
+    next_page_info_not_found_count = models.IntegerField(default=0)
+    has_next_page_info = models.BooleanField(null=True, blank=True)  # Latest report info
+
+    # Detailed failures and exceptions
+    failed_downloads_details = models.JSONField(default=list, blank=True)  # List of dicts or strings
+    storage_upload_failed = models.BooleanField(default=False)
+    task_completion_status = models.CharField(max_length=255, blank=True, default='')  # Optional status
+    has_billing_exception = models.BooleanField(default=False)
+    specific_exception_reason = models.CharField(max_length=255, blank=True, default='')  # Optional description
+
+    class Meta:
+        verbose_name = "Task Summary Report"
+        verbose_name_plural = "Task Summary Reports"
+        ordering = ['-updated_at']
+
+    def __str__(self):
+        return f"TaskSummaryReport(task_id={self.task})"
+
+
+
 class TaskAnalysisReport(models.Model):
+
     task=models.ForeignKey(Task,null=False,on_delete=models.CASCADE)
     run_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False,
                             )
@@ -79,6 +195,8 @@ class TaskAnalysisReport(models.Model):
 
     def __str__(self):
         return f"Report for {self.report_start_datetime} - {self.overall_task_status}"
+    
+
 # reporting_and_analytics/models.py
 # (Assuming other necessary imports like uuid, models, and timezone are at the top of the file)
 # (Also assuming the Task model is defined elsewhere in this file)
@@ -151,6 +269,11 @@ class TaskSummaryReport(models.Model):
 
     def __str__(self):
         return f"Summary for Task '{self.task.name}'"
+    
+
+
+
+
 class JobAnalysisReport(models.Model):
     """
     Stores consolidated analysis results for an entire bot job, aggregated from TaskAnalysisReports.

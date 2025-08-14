@@ -4,199 +4,211 @@ import uuid
 import datetime
 import logging
 from collections import defaultdict
+import json
 
 # --- Essential Django Imports for Aggregation ---
 from django.db import transaction
 from django.db.models import Max, Min, Sum, Avg # <--- Ensure Avg, Max, Min, Sum are imported
 from django.db.models.functions import Coalesce
+from django.utils import timezone
+from django.db.models import Max, Min
+import logging
 
-from .models import Task, TaskAnalysisReport, TaskSummaryReport
+from .models import Task, TaskAnalysisReport, TaskSummaryReport,TaskReport,TaskSummaryReportNew
 
 logger = logging.getLogger(__name__)
 
 @shared_task(bind=True, default_retry_delay=60, max_retries=3)
 def process_single_task_summary(self, task_uuid_str: str):
-    """
-    Celery task to calculate and update/create the TaskSummaryReport for a single task.
-    This task checks for new TaskAnalysisReports and re-aggregates the summary if needed.
-    """
     try:
-        task_uuid = uuid.UUID(task_uuid_str)
-    except ValueError:
-        logger.error(f"Invalid task_uuid_str provided to process_single_task_summary: {task_uuid_str}")
-        return
+        task_instance = Task.objects.get(uuid=task_uuid_str)
+        all_reports = TaskReport.objects.filter(task=task_instance).order_by('created_at')
 
-    try:
-        task_instance = Task.objects.get(uuid=task_uuid)
-    except Task.DoesNotExist:
-        logger.warning(f"Task with UUID {task_uuid_str} not found. Cannot process summary.")
-        return
+        if not all_reports.exists():
+            logger.warning(f"No reports found for task '{task_uuid_str}'.")
+            return f"No reports to summarize for task {task_uuid_str}."
 
-    logger.info(f"Processing summary for Task: '{task_instance.name if task_instance.name else task_instance.uuid}'")
+        # Only create summary after confirming reports exist
+        summary, created = TaskSummaryReportNew.objects.get_or_create(task=task_instance)
+        new_reports_qs = all_reports if created else all_reports.filter(created_at__gt=summary.updated_at)
 
-    try:
-        with transaction.atomic(): # Use atomic transaction for data consistency
-            # Get the current summary state to determine the 'high-water mark'
-            current_summary = TaskSummaryReport.objects.filter(task=task_instance).first()
-            last_processed_datetime = current_summary.last_report_datetime if current_summary else None
+        if not new_reports_qs.exists():
+            logger.info(f"No new reports to process for task '{task_uuid_str}'.")
+            return f"No new reports to process for task {task_uuid_str}."
 
-            # Find new reports since the last summary update
-            all_reports_for_task = TaskAnalysisReport.objects.filter(task=task_instance).order_by('-created_at')
+        # === INIT FIELDS === #
+        total_reports = all_reports.count()
+        print(f"total report found: {total_reports}")
+        critical_events = []
+        total_critical_events = 0
+        login_exceptions_summary = []
+        login_exceptions_count = 0
+        page_detection_exceptions_summary = []
+        page_detection_exceptions_count = 0
+        locate_element_exceptions_summary = []
+        locate_element_exceptions_count = 0
+        merged_page_load_details = {}
 
-            # Determine if new reports exist to warrant an update
-            new_reports_exist = False
-            if last_processed_datetime:
-                if all_reports_for_task.filter(created_at__gt=last_processed_datetime).exists():
-                    new_reports_exist = True
-            elif all_reports_for_task.exists():
-                # If no summary exists yet, but there are reports, then new_reports_exist is true
-                new_reports_exist = True
+        total_login_attempts = 0
+        successful_logins = 0
+        failed_logins = 0
+        total_login_time = 0.0
+        total_2fa_attempts = 0
+        total_2fa_successes = 0
+        total_2fa_failures = 0
+        total_2fa_time = 0.0
+        total_attempt_failed = 0
+        attempt_failed_errors = []
+        failed_attempt_error_logs = []
 
-            if not new_reports_exist:
-                logger.info(f"No new TaskAnalysisReports found for task '{task_instance.name if task_instance.name else task_instance.uuid}'. Skipping update.")
-                return
+        total_users_scraped = 0
+        total_downloaded_files = 0
+        total_storage_uploads = 0
+        found_next_page_info_count = 0
+        next_page_info_not_found_count = 0
 
-            # If no reports exist at all (e.g., all were deleted), remove the summary
-            if not all_reports_for_task.exists():
-                TaskSummaryReport.objects.filter(task=task_instance).delete()
-                logger.info(f"No TaskAnalysisReports exist for task '{task_instance.name if task_instance.name else task_instance.uuid}', summary deleted.")
-                return
+        failed_downloads_details = []
+        failed_to_download_file_count = 0
+        storage_upload_failed = False
+        task_completion_status = ""
+        has_billing_exception = False
+        specific_exception_reason = ""
+        has_logged_in_status = False
 
-            latest_report = all_reports_for_task.first() # Most recent report
+        for report in all_reports:
+            full = report.full_report or {}
+            if isinstance(full, str):
+                try:
+                    full = json.loads(full)
+                except json.JSONDecodeError:
+                    continue
 
-            # --- Aggregation Logic ---
-            aggregated_data = all_reports_for_task.aggregate(
-                total_runs_initiated=Coalesce(Sum('runs_initiated'), 0),
-                total_runs_completed=Coalesce(Sum('runs_completed'), 0),
-                total_runs_failed_exception=Coalesce(Sum('runs_failed_exception'), 0),
-                total_runs_incomplete=Coalesce(Sum('runs_incomplete'), 0),
-                total_found_next_page_info_count=Coalesce(Sum('found_next_page_info_count'), 0),
-                total_next_page_info_not_found_count=Coalesce(Sum('next_page_info_not_found_count'), 0),
-                total_saved_file_count=Coalesce(Sum('saved_file_count'), 0),
-                total_downloaded_file_count=Coalesce(Sum('downloaded_file_count'), 0),
-                total_failed_download_count=Coalesce(Sum('failed_download_count'), 0),
-                cumulative_total_runtime_seconds=Coalesce(Sum('total_task_runtime_seconds'), 0.0),
-                average_runtime_seconds_per_run=Coalesce(Avg('total_task_runtime_seconds'), 0.0), # Fixed Avg import
-                first_report_datetime=Min('created_at'),
-                last_report_datetime=Max('created_at'), # This will be the new high-water mark
-            )
+            total_critical_events += full.get('critical_events_count', 0)
+            critical_events.extend(full.get('critical_events_summary', []))
+            login_exceptions_summary.extend(full.get('login_exceptions_summary', []))
+            login_exceptions_count += full.get('login_exceptions_count', 0)
+            page_detection_exceptions_summary.extend(full.get('page_detection_exceptions_summary', []))
+            page_detection_exceptions_count += full.get('page_detection_exceptions_count', 0)
+            locate_element_exceptions_summary.extend(full.get('locate_element_exceptions_summary', []))
+            locate_element_exceptions_count += full.get('locate_element_exceptions_count', 0)
 
-            # Calculate has_next_page_info based on the specific new logic
-            calculated_has_next_page_info = None
-            if latest_report: # Ensure a latest report exists
-                if (latest_report.found_next_page_info_count > 0 and
-                    latest_report.next_page_info_not_found_count == 0):
-                    calculated_has_next_page_info = True
+            for url, details in full.get('page_load_details', {}).items():
+                if url not in merged_page_load_details:
+                    merged_page_load_details[url] = details
                 else:
-                    calculated_has_next_page_info = False
+                    for key, val in details.items():
+                        if isinstance(val, (int, float)):
+                            merged_page_load_details[url][key] = merged_page_load_details[url].get(key, 0) + val
 
-            # Prepare aggregated JSON & Text Summaries (requires iteration)
-            aggregated_scraped_data_dict = defaultdict(lambda: 0)
-            aggregated_data_enrichment_dict = defaultdict(lambda: 0)
-            all_non_fatal_errors_set = set()
-            all_exceptions_set = set()
-            all_specific_exception_reasons_set = set()
-            all_failed_downloads_summary_set = set()
+            if 'total_login_attempts' in full:
+                total_login_attempts += full.get('total_login_attempts', 0)
+                successful_logins += full.get('successful_logins', 0)
+                failed_logins += full.get('failed_logins', 0)
+                total_login_time += full.get('total_login_time', 0.0)
+                total_2fa_attempts += full.get('2fa_attempts', 0)
+                total_2fa_successes += full.get('2fa_successes', 0)
+                total_2fa_failures += full.get('2fa_failures', 0)
+                total_2fa_time += full.get('2fa_total_time', 0.0)
+                total_attempt_failed += full.get('total_attempt_failed', 0)
+                errors = full.get('attempt_failed_errors', [])
+                attempt_failed_errors.extend([
+                    err.get('type') for err in errors if isinstance(err, dict) and 'type' in err
+                ])
+                failed_attempt_error_logs.append({
+                    "run_id": str(report.run_id),
+                    "errors": errors,
+                })
 
-            for report in all_reports_for_task:
-                # Safely iterate over JSONFields, checking if they are dictionaries
-                if isinstance(report.scraped_data_summary, dict):
-                    for key, value in report.scraped_data_summary.items():
-                        if isinstance(value, (int, float)):
-                            aggregated_scraped_data_dict[key] += value
+            scrape_summary = full.get('scraped_data_summary', {})
+            total_users_scraped += scrape_summary.get('total_users_scraped', 0)
+            total_downloaded_files += full.get('downloaded_file_count', 0)
+            total_storage_uploads += full.get('storage_house_uploads', 0)
+            found_next_page_info_count += full.get('found_next_page_info_count', 0)
+            next_page_info_not_found_count += full.get('next_page_info_not_found_count', 0)
+            failed_downloads_details.extend(full.get("failed_downloads_details", []))
+            failed_to_download_file_count += full.get("failed_to_download_file_count", 0)
+            storage_upload_failed |= full.get("storage_house_upload_failures", False)
+            task_completion_status = full.get("task_completion_status", task_completion_status)
+            has_billing_exception |= full.get("has_billing_exception", False)
+            specific_exception_reason = full.get("specific_exception_reason", specific_exception_reason)
+            # ✅ Track login status
+            if full.get('bot_login_status_for_run') == 'Logged In':
+                has_logged_in_status = True
 
-                if isinstance(report.data_enrichment_summary, dict):
-                    for key, value in report.data_enrichment_summary.items():
-                        if isinstance(value, (int, float)):
-                            aggregated_data_enrichment_dict[key] += value
+        latest_report = all_reports.last()
+        latest_full = latest_report.full_report or {}
+        if isinstance(latest_full, str):
+            try:
+                latest_full = json.loads(latest_full)
+            except json.JSONDecodeError:
+                latest_full = {}
 
-                # Aggregate string-based summary fields, ensuring they are not None/empty strings
-                if report.non_fatal_errors_summary:
-                    all_non_fatal_errors_set.update(
-                        msg.strip() for msg in report.non_fatal_errors_summary.split(';') if msg.strip()
-                    )
-                if report.exceptions_summary:
-                    all_exceptions_set.update(
-                        msg.strip() for msg in report.exceptions_summary.split(';') if msg.strip()
-                    )
-                if report.specific_exception_reasons:
-                    all_specific_exception_reasons_set.update(
-                        msg.strip() for msg in report.specific_exception_reasons.split(';') if msg.strip()
-                    )
-                if report.failed_downloads_summary:
-                    all_failed_downloads_summary_set.update(
-                        msg.strip() for msg in report.failed_downloads_summary.split(';') if msg.strip()
-                    )
+        start_ts = latest_report.report_start_datetime
+        end_ts = latest_report.report_end_datetime
 
-            # Convert sets to lists and defaultdicts to regular dicts for JSONField
-            all_non_fatal_errors_list = list(all_non_fatal_errors_set)
-            all_exceptions_list = list(all_exceptions_set)
-            all_specific_exception_reasons_list = list(all_specific_exception_reasons_set)
-            all_failed_downloads_summary_list = list(all_failed_downloads_summary_set)
-            aggregated_scraped_data_final = dict(aggregated_scraped_data_dict)
-            aggregated_data_enrichment_final = dict(aggregated_data_enrichment_dict)
+        # === ASSIGN SUMMARY === #
+        summary.total_reports_considered = total_reports
+        summary.first_report_datetime = all_reports.aggregate(Min('created_at'))['created_at__min']
+        summary.last_report_datetime = all_reports.aggregate(Max('created_at'))['created_at__max']
+        summary.total_critical_events = total_critical_events
+        summary.critical_events_summary = critical_events
+        summary.login_exceptions_summary = login_exceptions_summary
+        summary.login_exceptions_count = login_exceptions_count
+        summary.page_detection_exceptions_summary = page_detection_exceptions_summary
+        summary.page_detection_exceptions_count = page_detection_exceptions_count
+        summary.locate_element_exceptions_summary = locate_element_exceptions_summary
+        summary.locate_element_exceptions_count = locate_element_exceptions_count
+        summary.page_load_details = merged_page_load_details
+        summary.has_next_page_info = latest_full.get('has_next_page_info')
+        summary.latest_task_status = latest_full.get('status', latest_report.service or 'unknown')
+        # ✅ Correct login status logic
+        summary.latest_login_status = 'success' if has_logged_in_status or successful_logins > 0 else 'failed'
+        summary.latest_report_start_datetime = start_ts
+        summary.latest_report_end_datetime = end_ts
+        summary.latest_total_task_runtime = (
+            round((end_ts - start_ts).total_seconds(), 2)
+            if (start_ts and end_ts) else 0.0
+        )
+        summary.run_id_of_latest_report = latest_report.run_id
 
+        summary.total_login_attempts = total_login_attempts
+        summary.successful_logins = successful_logins
+        summary.failed_logins = failed_logins
+        summary.total_login_time = total_login_time
+        summary.total_2fa_attempts = total_2fa_attempts
+        summary.total_2fa_successes = total_2fa_successes
+        summary.total_2fa_failures = total_2fa_failures
+        summary.total_2fa_time = total_2fa_time
+        summary.total_attempt_failed = total_attempt_failed
+        summary.attempt_failed_errors = attempt_failed_errors
+        summary.failed_attempt_error_logs = failed_attempt_error_logs
 
-            # --- Update or Create TaskSummaryReport ---
-            summary_report, created = TaskSummaryReport.objects.update_or_create(
-                task=task_instance,
-                defaults={
-                    # Aggregated Metrics
-                    "total_runs_initiated": aggregated_data['total_runs_initiated'],
-                    "total_runs_completed": aggregated_data['total_runs_completed'],
-                    "total_runs_failed_exception": aggregated_data['total_runs_failed_exception'],
-                    "total_runs_incomplete": aggregated_data['total_runs_incomplete'],
-                    "total_found_next_page_info_count": aggregated_data['total_found_next_page_info_count'],
-                    "total_next_page_info_not_found_count": aggregated_data['total_next_page_info_not_found_count'],
-                    "total_saved_file_count": aggregated_data['total_saved_file_count'],
-                    "total_downloaded_file_count": aggregated_data['total_downloaded_file_count'],
-                    "total_failed_download_count": aggregated_data['total_failed_download_count'],
-                    "cumulative_total_runtime_seconds": round(aggregated_data['cumulative_total_runtime_seconds'], 3),
-                    "average_runtime_seconds_per_run": round(aggregated_data['average_runtime_seconds_per_run'], 3) if aggregated_data['average_runtime_seconds_per_run'] is not None else 0.0,
+        summary.total_users_scraped = total_users_scraped
+        summary.total_downloaded_files = total_downloaded_files
+        summary.total_storage_uploads = total_storage_uploads
+        summary.found_next_page_info_count = found_next_page_info_count
+        summary.next_page_info_not_found_count = next_page_info_not_found_count
 
-                    # Latest States (from latest_report)
-                    "latest_overall_task_status": latest_report.overall_task_status if latest_report else None,
-                    "latest_overall_bot_login_status": latest_report.overall_bot_login_status if latest_report else None,
-                    "latest_last_status_of_task": latest_report.last_status_of_task if latest_report else None,
-                    "latest_billing_issue_resolution_status": latest_report.billing_issue_resolution_status if latest_report else None,
-                    "latest_report_start_datetime": latest_report.report_start_datetime if latest_report else None,
-                    "latest_report_end_datetime": latest_report.report_end_datetime if latest_report else None,
-                    "latest_total_task_runtime_text": latest_report.total_task_runtime_text if latest_report else None,
-                    "run_id_of_latest_report": latest_report.run_id if latest_report else None,
+        summary.failed_downloads_details = failed_downloads_details
+        summary.failed_to_download_file_count = failed_to_download_file_count
+        summary.storage_upload_failed = storage_upload_failed
+        summary.task_completion_status = task_completion_status
+        summary.has_billing_exception = has_billing_exception
+        summary.specific_exception_reason = specific_exception_reason
 
-                    # Specific metrics from the LAST RUN
-                    "latest_scraped_data_summary": latest_report.scraped_data_summary if latest_report else {},
-                    "latest_data_enrichment_summary": latest_report.data_enrichment_summary if latest_report else {},
+        summary.updated_at = timezone.now()
+        summary.save()
 
-                    # Aggregated JSON & Text Summaries
-                    "aggregated_scraped_data": aggregated_scraped_data_final,
-                    "aggregated_data_enrichment": aggregated_data_enrichment_final,
-                    "all_non_fatal_errors": all_non_fatal_errors_list,
-                    "all_exceptions": all_exceptions_list,
-                    "all_specific_exception_reasons": all_specific_exception_reasons_list,
-                    "all_failed_downloads_summary": all_failed_downloads_summary_list,
-
-                    # Meta-Information about the aggregation
-                    "total_reports_considered": all_reports_for_task.count(),
-                    "first_report_datetime": aggregated_data['first_report_datetime'],
-                    "last_report_datetime": aggregated_data['last_report_datetime'], # This is key for the next run's filter
-
-                    # Calculated Boolean Field
-                    "has_next_page_info": calculated_has_next_page_info,
-                }
-            )
-
-            if created:
-                logger.info(f"CREATED TaskSummaryReport for task '{task_instance.name if task_instance.name else task_instance.uuid}'.")
-            else:
-                logger.info(f"UPDATED TaskSummaryReport for task '{task_instance.name if task_instance.name else task_instance.uuid}'.")
+        logger.info(f"{'CREATED' if created else 'UPDATED'} TaskSummaryReport for task '{task_instance.name or task_uuid_str}'.")
 
         return f"Successfully processed summary for task {task_uuid_str}."
 
     except Exception as e:
         logger.error(f"Error processing summary for task '{task_uuid_str}': {e}", exc_info=True)
-        # Allows Celery to retry the task
         raise self.retry(exc=e)
+
+
+
 
 @shared_task(bind=True, default_retry_delay=300, max_retries=2)
 def process_all_task_summaries(self):

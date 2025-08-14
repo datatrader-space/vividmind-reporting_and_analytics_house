@@ -1,7 +1,7 @@
 # reporting_and_analytics/serializers.py
 
 from rest_framework import serializers
-from .models import Task, TaskAnalysisReport, JobAnalysisReport, CostUnitConfig
+from .models import Task, TaskAnalysisReport, JobAnalysisReport, CostUnitConfig,TaskSummaryReportNew
 import datetime
 import uuid
 
@@ -14,6 +14,9 @@ class TaskSerializerForReport(serializers.ModelSerializer):
         model = Task
         fields = ['uuid', 'job_uuid', 'name', 'task_type', 'interact']
         read_only=True
+
+
+
 
 class TaskAnalysisReportSerializer(serializers.ModelSerializer):
     """
@@ -180,3 +183,37 @@ class TaskSummaryReportSerializer(serializers.ModelSerializer):
         # meant to be generated and updated by internal processes (Celery/management command),
         # not directly via the API.
         read_only = True 
+
+
+
+class TaskSummaryReportNewSerializer(serializers.ModelSerializer):
+    """
+    Serializer for the TaskSummaryReportNew model.
+    Designed for read-only access to aggregated task summary data.
+    """
+    task_details = TaskSerializerForReport(source='task', read_only=True)
+
+    
+    # Explicitly define JSON fields for clarity and documentation
+    critical_events_summary = serializers.JSONField()
+    attempt_failed_errors = serializers.JSONField()
+    failed_attempt_error_logs = serializers.JSONField()
+    login_exceptions_summary = serializers.JSONField()
+    page_detection_exceptions_summary = serializers.JSONField()
+    locate_element_exceptions_summary = serializers.JSONField()
+    page_load_details = serializers.JSONField()
+
+    class Meta:
+        model = TaskSummaryReportNew
+        fields = '__all__'
+        read_only_fields = [
+            'id', 'task', 'task_details',
+            'critical_events_summary',
+            'attempt_failed_errors',
+            'failed_attempt_error_logs',
+            'login_exceptions_summary',
+            'page_detection_exceptions_summary',
+            'locate_element_exceptions_summary',
+            'page_load_details',
+            # add any other fields in your model
+        ]

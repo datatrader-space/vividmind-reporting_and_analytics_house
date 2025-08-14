@@ -7,15 +7,17 @@ import json
 import logging
 import datetime
 import uuid
+from .analysis_report import generate_task_report_summary
 
 from rest_framework import generics, filters, status
+from rest_framework.generics import RetrieveAPIView
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny
 from django.db import transaction, IntegrityError
 from django.db.models import Q # For complex queries
 
-from .models import TaskAnalysisReport, TaskSummaryReport
-from .serializers import TaskAnalysisReportSerializer,TaskSummaryReportSerializer
+from .models import TaskAnalysisReport, TaskSummaryReport,TaskReport,Task,TaskSummaryReportNew
+from .serializers import TaskAnalysisReportSerializer,TaskSummaryReportSerializer,TaskSummaryReportNewSerializer
 from django_filters.rest_framework import DjangoFilterBackend
 import django_filters
 # Removed: from .utils.redis_tracker import add_processed_task_report_run_id
@@ -94,110 +96,96 @@ class TaskAnalysisReportListCreateAPIView(generics.ListCreateAPIView):
         return queryset
 
     def create(self, request, *args, **kwargs):
-        """
-        Handles POST requests for batch ingestion of TaskAnalysisReport instances.
-        Expects a list of report dictionaries.
-        """
-        if not isinstance(request.data['data'], list):
+        payload = request.data
+        reports = payload.get("data", [])
+        
+
+        if not isinstance(reports, list):
             return Response(
-                {"detail": "Expected a list of task reports for batch ingestion."},
+                {"detail": "Expected a list under 'data' key."},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        processed_reports_count = 0
-        successful_reports_data = []
-        errors = []
+        created_reports = []
+        print(reports)
+        for report_data in reports:
+            try:
+                run_id = report_data.get('run_id')
+                task_uuid = report_data.get('task_uuid')  # Expecting this as input
+                service = report_data.get('service')
+                end_point = report_data.get('end_point')
+                data_point = report_data.get('data_point')
+                full_report = report_data
+                start_ts = report_data.get('report_start_datetime')
+                end_ts = report_data.get('report_end_datetime')
 
-        with transaction.atomic():
-            for index, report_data in enumerate(request.data['data']):
-                current_run_id = report_data.get('run_id')
-                current_start_datetime = report_data.get('report_start_datetime')
-                current_end_datetime = report_data.get('report_end_datetime')
+                report_start_datetime = datetime.datetime.fromtimestamp(start_ts / 1000, tz=datetime.timezone.utc) if isinstance(start_ts, (int, float)) else None
+                report_end_datetime = datetime.datetime.fromtimestamp(end_ts / 1000, tz=datetime.timezone.utc) if isinstance(end_ts, (int, float)) else None
 
-                # Prepare serializer for validation and potential saving
-                # partial=True allows for partial updates if an instance is found
-                serializer = self.get_serializer(data=report_data, partial=True)
+                # Ensure task_uuid is a UUID object
+                if isinstance(task_uuid, str):
+                    task_uuid = uuid.UUID(task_uuid)
 
-                if serializer.is_valid():
-                    try:
-                        # Convert datetime fields to proper datetime objects for query if they are timestamps
-                        if isinstance(current_start_datetime, (int, float)):
-                            current_start_datetime_dt = datetime.datetime.fromtimestamp(current_start_datetime / 1000, tz=datetime.timezone.utc)
-                        else:
-                            current_start_datetime_dt = current_start_datetime # Assume it's already a datetime object or None
-
-                        if isinstance(current_end_datetime, (int, float)):
-                            current_end_datetime_dt = datetime.datetime.fromtimestamp(current_end_datetime / 1000, tz=datetime.timezone.utc)
-                        else:
-                            current_end_datetime_dt = current_end_datetime # Assume it's already a datetime object or None
-
-                        # Check for existing report by run_id OR by datetime range
-                        # Using Q objects for OR logic
-                        existing_report = None
-                        query = Q()
-
-                        # Only add datetime range to query if both start and end times are provided and valid
-                        if current_start_datetime_dt and current_end_datetime_dt:
-                            # Check for exact match or overlap
-                            query |= Q(
-                                report_start_datetime=current_start_datetime_dt,
-                                report_end_datetime=current_end_datetime_dt
-                            )
-                            # You might also want to check for overlaps if reports can span time:
-                            # query |= Q(
-                            #     report_start_datetime__lte=current_end_datetime_dt,
-                            #     report_end_datetime__gte=current_start_datetime_dt
-                            # )
-
-                        if (current_start_datetime_dt and current_end_datetime_dt):
-                            try:
-                                existing_report = TaskAnalysisReport.objects.filter(query).first()
-                            except Exception as e:
-                                errors.append(f"Entry {index} (run_id: {current_run_id}): Error checking for existing report - {e}")
-                                logger.error(f"Error checking for existing report {current_run_id}: {e}", exc_info=True)
-                                continue # Skip to next report
-
-                        if existing_report:
-                            # Update existing report
-                            
-                            errors.append(f"Entry {index} (run_id: {current_run_id}): Error Report already exists -")
-                            logger.error(f"Error Report already exists", exc_info=True)
-                            
-                        else:
-                            # Create new report
-                            report_instance = serializer.save()
-                            logger.info(f"Created new TaskAnalysisReport for run_id: {report_instance.run_id}")
-                            successful_reports_data.append({
-                                "run_id": str(report_instance.run_id),
-                                "task_uuid": str(report_instance.task.uuid),
-                                "status": "created"
-                            })
-                        
-                        processed_reports_count += 1
-
-                    except IntegrityError as e:
-                        errors.append(f"Entry {index} (run_id: {current_run_id}): Database integrity error - {e}")
-                        logger.error(f"Integrity error for task report entry {index} (run_id: {current_run_id}): {e}", exc_info=True)
-                    except Exception as e:
-                        errors.append(f"Entry {index} (run_id: {current_run_id}): An unexpected error occurred - {e}")
-                        logger.exception(f"Unexpected error processing task report entry {index} (run_id: {current_run_id}).")
-                else:
-                    errors.append(f"Entry {index} (run_id: {current_run_id}): Validation failed - {serializer.errors}")
-                    logger.warning(f"Validation failed for task report entry {index} (run_id: {current_run_id}): {serializer.errors}")
-
-            if errors:
-                transaction.set_rollback(True)
-                logger.error(f"Batch ingestion failed due to errors: {errors}")
-                return Response(
-                    {"message": f"Successfully processed {processed_reports_count} reports with errors.", "details": errors},
-                    status=status.HTTP_200_OK
+                task, created = Task.objects.get_or_create(
+                    uuid=task_uuid,
+                    defaults={
+                        "name": f"AutoCreated-{task_uuid.hex[:8]}",   # or just "Unnamed Task"
+                        "task_type": "unknown",                        # or any safe default
+                        "interact": False,
+                    }
                 )
 
-            logger.info(f"Batch ingestion completed. Processed {processed_reports_count} task reports successfully.")
+                if created:
+                    logger.info(f"Created new Task with uuid={task_uuid}")
+                else:
+                    logger.debug(f"Found existing Task with uuid={task_uuid}")
+
+                # Optional duplicate check
+                existing = TaskReport.objects.filter(
+                    report_start_datetime=report_start_datetime,
+                    report_end_datetime=report_end_datetime,
+                    run_id=run_id,
+                    task=task,
+                    data_point=data_point
+                ).first()
+
+                if existing:
+                    logger.warning(f"Duplicate report: run_id={run_id}")
+                    continue  # skip this report
+
+                report = TaskReport.objects.create(
+                    task=task,
+                    run_id=run_id,
+                    service=service,
+                    end_point=end_point,
+                    data_point=data_point,
+                    report_start_datetime=report_start_datetime,
+                    report_end_datetime=report_end_datetime,
+                    full_report=full_report,
+                )
+                created_reports.append(str(report.id))
+
+            except Exception as e:
+                logger.exception(f"Failed to process report: {e}")
+                continue  # Skip this item but don't crash the entire batch
+
+        if created_reports:
             return Response(
-                {"message": f"Successfully processed {processed_reports_count} task reports.", "processed_reports": successful_reports_data},
+                {"message": f"{len(created_reports)} reports created.", "report_ids": created_reports},
                 status=status.HTTP_201_CREATED
             )
+        else:
+            return Response(
+                {"detail": "No new reports were created."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+
+        
+
+
+
+        
 class TaskSummaryReportFilter(django_filters.FilterSet):
 
     # Filter by the UUID of the associated Task
@@ -265,16 +253,20 @@ class TaskSummaryReportListView(generics.ListAPIView):
     # the most recently updated ones first by default.
     ordering = ['-updated_at']
 
-class TaskSummaryReportDetailView(generics.RetrieveAPIView):
+
+class TaskSummaryReportDetailViewNew(generics.RetrieveAPIView):
+
+
+
     """
     API endpoint to retrieve a single TaskSummaryReport instance.
     The lookup is performed using the associated Task's UUID.
     """
     # Define the queryset, again using select_related for efficient retrieval.
-    queryset = TaskSummaryReport.objects.all().select_related('task')
+    queryset = TaskSummaryReportNew.objects.all().select_related('task')
     
     # Specify the serializer for a single instance.
-    serializer_class = TaskSummaryReportSerializer
+    serializer_class = TaskSummaryReportNewSerializer
     
     # Set the permission policy. As with the list view, consider `IsAuthenticated` for production.
     permission_classes = [AllowAny]
@@ -286,3 +278,75 @@ class TaskSummaryReportDetailView(generics.RetrieveAPIView):
     # This specifies the name of the URL keyword argument that will hold the UUID.
     # For example, if your URL is `task-summaries/<uuid:task_uuid>/`, then `task_uuid` is the kwarg.
     lookup_url_kwarg = 'task_uuid'
+
+import json
+from django.views.decorators.csrf import csrf_exempt
+from django.http import JsonResponse, HttpResponseBadRequest
+from django.db import transaction
+
+
+@csrf_exempt
+def update_task_summaries(request):
+    if request.method != "POST":
+        return HttpResponseBadRequest("Only POST method allowed")
+
+    try:
+        data = json.loads(request.body)
+        print("Received payload:", data)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    task_uuid = data.get("task_uuid")
+    status = data.get("status")
+    
+    # Handle single string or list of issues
+    issues = data.get("issues") or [data.get("issue")]
+
+    if not task_uuid or not status:
+        return JsonResponse({"error": "Missing task_uuid or status"}, status=400)
+
+    if status.lower() == "pending":
+        return JsonResponse({
+            "message": "Status is pending, no changes made.",
+            "status": "200"
+        })
+
+    try:
+        summary = TaskSummaryReportNew.objects.get(task=task_uuid)
+    except TaskSummaryReportNew.DoesNotExist:
+        return JsonResponse({"error": f"No TaskSummaryReportNew found for uuid {task_uuid}"}, status=404)
+
+    updated = False
+    for issue_item in issues:
+        # Normalize issue name
+        if isinstance(issue_item, dict):
+            issue_name = issue_item.get("issue_name", "").lower()
+        else:
+            issue_name = str(issue_item or "").lower()
+
+        if issue_name == "incorrect password":
+            original_len = len(summary.critical_events_summary or [])
+            summary.critical_events_summary = [
+                event for event in (summary.critical_events_summary or [])
+                if str(event).lower() != "incorrect_password"
+            ]
+            if len(summary.critical_events_summary) != original_len:
+                updated = True
+
+        elif issue_name == "storage house down":
+            if getattr(summary, "storage_upload_failed", True):
+                summary.storage_upload_failed = False
+                updated = True
+
+        elif issue_name == "login attempts failed":
+            if getattr(summary, "total_attempt_failed", 0) != 0:
+                summary.total_attempt_failed = 0
+                updated = True
+
+    if updated:
+        summary.save()
+
+    return JsonResponse({
+        "message": "TaskSummary updated based on issues.",
+        "status": "200"
+    })
