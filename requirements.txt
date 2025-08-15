@@ -48,3 +48,6 @@ django-cors-headers
 eventlet
 django-jsonform
 django-filter>=23.1
+dj_database_url
+gunicorn
+whitenoise>=6.6.0

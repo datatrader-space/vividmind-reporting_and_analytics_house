@@ -1,0 +1,102 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: vividmind_db
+      POSTGRES_USER: vividmind_user
+      POSTGRES_PASSWORD: supersecretpassword
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: always
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    restart: always
+
+  web:
+    build: .
+    command: >
+      sh -c "
+        echo 'Waiting for Postgres...'; 
+        until nc -z db 5432; do sleep 0.5; done; 
+        echo 'Postgres is ready.'; 
+        echo 'Waiting for Redis...'; 
+        until nc -z redis 6379; do sleep 0.5; done; 
+        echo 'Running makemigrations...'; 
+        python manage.py makemigrations reporting; 
+        echo 'Running migrate...'; 
+        python manage.py migrate; 
+        echo 'Collecting static files...'; 
+        python manage.py collectstatic --noinput; 
+        echo 'Starting Gunicorn...'; 
+        gunicorn vividmind.wsgi:application --bind 0.0.0.0:8000 --workers 1
+      "
+    volumes:
+      - .:/app
+      - static_volume:/app/static
+    depends_on:
+      - db
+      - redis
+    env_file:
+      - .env
+    restart: always
+
+  celery:
+    build: .
+    command: >
+      sh -c "
+        echo 'Waiting for Postgres...'; 
+        until nc -z db 5432; do sleep 0.5; done; 
+        echo 'Waiting for Redis...'; 
+        until nc -z redis 6379; do sleep 0.5; done; 
+        celery -A vividmind worker -l info
+      "
+    volumes:
+      - .:/app
+    depends_on:
+      - web
+    env_file:
+      - .env
+    restart: always
+
+  celery-beat:
+    build: .
+    command: >
+      sh -c "
+        echo 'Waiting for Postgres...'; 
+        until nc -z db 5432; do sleep 0.5; done; 
+        echo 'Waiting for Redis...'; 
+        until nc -z redis 6379; do sleep 0.5; done; 
+        echo 'Waiting for django_celery_beat_periodictask table...'; 
+        until python manage.py dbshell -c '\dt django_celery_beat_periodictask' 2>/dev/null; do sleep 2; done; 
+        echo 'Starting celery-beat...'; 
+        celery -A vividmind beat -l info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+      "
+    volumes:
+      - .:/app
+    depends_on:
+      - web
+    env_file:
+      - .env
+    restart: always
+
+  nginx:
+    image: nginx:1.24
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf
+      - static_volume:/app/static
+    depends_on:
+      - web
+    restart: always
+
+volumes:
+  postgres_data:
+  static_volume:

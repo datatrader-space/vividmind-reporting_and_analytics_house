@@ -5,3 +5,88 @@ venv
 data
 media
 .env
+
+# Django migrations
+*/migrations/
+# Python cache
+__pycache__/
+*.pyc
+# ----------------------
+# Python
+# ----------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*$py.class
+
+# Virtual environment
+venv/
+env/
+ENV/
+.env/
+
+# ----------------------
+# Django
+# ----------------------
+*.log
+*.pot
+*.pyc
+*.mo
+*.db
+*.sqlite3
+db.sqlite3
+media/
+staticfiles/
+static/
+local_settings.py
+*.cover
+coverage/
+htmlcov/
+*.egg-info/
+.installed.cfg
+*.egg
+*.manifest
+*.spec
+
+# Django migrations
+*/migrations/
+!*/migrations/__init__.py
+
+# ----------------------
+# Celery / Redis / Task queues
+# ----------------------
+celerybeat-schedule
+celerybeat.pid
+*.pid
+*.seed
+*.log
+
+# ----------------------
+# IDE / Editor / OS
+# ----------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ----------------------
+# Logs / Reports
+# ----------------------
+logs/
+*.log
+*.out
+*.err
+*.traceback
+
+# ----------------------
+# Pytest / Coverage
+# ----------------------
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.pytest_cache/
