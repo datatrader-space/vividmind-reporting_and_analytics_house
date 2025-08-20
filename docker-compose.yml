@@ -25,17 +25,11 @@ services:
       sh -c "
         echo 'Waiting for Postgres...'; 
         until nc -z db 5432; do sleep 0.5; done; 
-        echo 'Postgres is ready.'; 
         echo 'Waiting for Redis...'; 
         until nc -z redis 6379; do sleep 0.5; done; 
-        echo 'Running makemigrations...'; 
-        python manage.py makemigrations reporting; 
-        echo 'Running migrate...'; 
-        python manage.py migrate; 
-        echo 'Collecting static files...'; 
+        python manage.py migrate --noinput; 
         python manage.py collectstatic --noinput; 
-        echo 'Starting Gunicorn...'; 
-        gunicorn vividmind.wsgi:application --bind 0.0.0.0:8000 --workers 1
+        gunicorn vividmind.wsgi:application --bind 0.0.0.0:8000 --workers 2
       "
     volumes:
       - .:/app
@@ -60,7 +54,8 @@ services:
     volumes:
       - .:/app
     depends_on:
-      - web
+      - db
+      - redis
     env_file:
       - .env
     restart: always
@@ -73,15 +68,15 @@ services:
         until nc -z db 5432; do sleep 0.5; done; 
         echo 'Waiting for Redis...'; 
         until nc -z redis 6379; do sleep 0.5; done; 
-        echo 'Waiting for django_celery_beat_periodictask table...'; 
-        until python manage.py dbshell -c '\dt django_celery_beat_periodictask' 2>/dev/null; do sleep 2; done; 
+        python manage.py migrate --noinput; 
         echo 'Starting celery-beat...'; 
         celery -A vividmind beat -l info --scheduler django_celery_beat.schedulers:DatabaseScheduler
       "
     volumes:
       - .:/app
     depends_on:
-      - web
+      - db
+      - redis
     env_file:
       - .env
     restart: always
